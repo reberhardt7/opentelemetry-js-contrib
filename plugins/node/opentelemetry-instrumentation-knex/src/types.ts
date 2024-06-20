@@ -20,4 +20,6 @@ export interface KnexInstrumentationConfig extends InstrumentationConfig {
   maxQueryLength?: number;
   /** only create spans if part of an existing trace */
   requireParentSpan?: boolean;
+  /** create spans for acquiring db connections */
+  instrumentAcquireConnection?: boolean;
 }

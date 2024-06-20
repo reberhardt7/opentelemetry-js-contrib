@@ -545,6 +545,36 @@ describe('Knex instrumentation', () => {
       ]);
     });
   });
+
+  describe('Setting instrumentAcquireConnection=true', () => {
+    beforeEach(() => {
+      plugin.disable();
+      plugin.setConfig({ instrumentAcquireConnection: true });
+      plugin.enable();
+    });
+
+    it('should capture acquiring a connection', async () => {
+      await tracer.startActiveSpan('parentSpan', async parentSpan => {
+        assert.deepEqual(await client.raw('select 1 as result'), [
+          { result: 1 },
+        ]);
+        parentSpan.end();
+      });
+      const finished = memoryExporter.getFinishedSpans();
+      assert.strictEqual(finished.length, 3);
+      assert.strictEqual(finished[0].name, 'acquire sqlite3 connection');
+      assert.strictEqual(
+        finished[0].parentSpanId,
+        finished[2].spanContext().spanId
+      );
+      assert.strictEqual(finished[1].name, 'raw :memory:');
+      assert.strictEqual(
+        finished[1].parentSpanId,
+        finished[2].spanContext().spanId
+      );
+      assert.strictEqual(finished[2].name, 'parentSpan');
+    });
+  });
 });
 
 const assertSpans = (actualSpans: any[], expectedSpans: any[]) => {

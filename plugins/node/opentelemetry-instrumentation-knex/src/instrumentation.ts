@@ -41,6 +41,7 @@ const contextSymbol = Symbol('opentelemetry.instrumentation-knex.context');
 const DEFAULT_CONFIG: types.KnexInstrumentationConfig = {
   maxQueryLength: 1022,
   requireParentSpan: false,
+  instrumentAcquireConnection: false,
 };
 
 export class KnexInstrumentation extends InstrumentationBase<types.KnexInstrumentationConfig> {
@@ -92,7 +93,7 @@ export class KnexInstrumentation extends InstrumentationBase<types.KnexInstrumen
     return new InstrumentationNodeModuleFile(
       `knex/${basePath}/client.js`,
       constants.SUPPORTED_VERSIONS,
-      (Client: any) => {
+      (Client: any, moduleVersion) => {
         this.ensureWrapped(
           Client.prototype,
           'queryBuilder',
@@ -108,12 +109,22 @@ export class KnexInstrumentation extends InstrumentationBase<types.KnexInstrumen
           'raw',
           this.storeContext.bind(this)
         );
+        if (this._config.instrumentAcquireConnection) {
+          this.ensureWrapped(
+            Client.prototype,
+            'acquireConnection',
+            this.createAcquireConnectionWrapper(moduleVersion)
+          );
+        }
         return Client;
       },
       (Client: any) => {
         this._unwrap(Client.prototype, 'queryBuilder');
         this._unwrap(Client.prototype, 'schemaBuilder');
         this._unwrap(Client.prototype, 'raw');
+        if (isWrapped(Client.prototype.acquireConnection)) {
+          this._unwrap(Client.prototype, 'acquireConnection');
+        }
         return Client;
       }
     );
@@ -192,6 +203,62 @@ export class KnexInstrumentation extends InstrumentationBase<types.KnexInstrumen
             const clonedError = utils.cloneErrorWithNewMessage(err, message);
             span.recordException(clonedError);
             span.setStatus({ code: api.SpanStatusCode.ERROR, message });
+            span.end();
+            throw err;
+          });
+      };
+    };
+  }
+
+  private createAcquireConnectionWrapper(moduleVersion?: string) {
+    const instrumentation = this;
+    return function wrapAcquireConnection(original: (...args: any[]) => any) {
+      return function wrappedAcquireConnection(this: any, query: any) {
+        const parentSpan = api.trace.getActiveSpan();
+        const hasActiveParent =
+          parentSpan && api.trace.isSpanContextValid(parentSpan.spanContext());
+        if (instrumentation._config.requireParentSpan && !hasActiveParent) {
+          return original.bind(this)(...arguments);
+        }
+
+        const name =
+          this.connectionSettings?.filename ||
+          this.connectionSettings?.database;
+
+        const attributes: api.SpanAttributes = {
+          'knex.version': moduleVersion,
+          [SEMATTRS_DB_SYSTEM]: utils.mapSystem(this.config.client),
+          [SEMATTRS_DB_USER]: this.connectionSettings?.user,
+          [SEMATTRS_DB_NAME]: name,
+          [SEMATTRS_NET_PEER_NAME]: this.connectionSettings?.host,
+          [SEMATTRS_NET_PEER_PORT]: this.connectionSettings?.port,
+          [SEMATTRS_NET_TRANSPORT]:
+            this.connectionSettings?.filename === ':memory:'
+              ? 'inproc'
+              : undefined,
+        };
+
+        const span = instrumentation.tracer.startSpan(
+          `acquire ${this.config.client} connection`,
+          {
+            kind: api.SpanKind.CLIENT,
+            attributes,
+          }
+        );
+        const spanContext = api.trace.setSpan(api.context.active(), span);
+
+        return api.context
+          .with(spanContext, original, this, ...arguments)
+          .then((result: unknown) => {
+            span.end();
+            return result;
+          })
+          .catch((err: any) => {
+            span.recordException(err);
+            span.setStatus({
+              code: api.SpanStatusCode.ERROR,
+              message: err.message,
+            });
             span.end();
             throw err;
           });
